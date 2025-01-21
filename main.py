@@ -1,23 +1,26 @@
 import os
 import numpy as np
-from scipy.spatial import Delaunay, cKDTree
+from scipy.spatial import Delaunay
 import ezdxf
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, Polygon
+from shapely.ops import polygonize, unary_union, linemerge, cascaded_union
 import pyvista as pv
 
 # Constants
 INPUT_DXF = "contours_extra.dxf"
 OUTPUT_DXF = "output/lowest_zones.dxf"
-TIN_RESOLUTION = 10  # Resolution for TIN grids
-INTERSECTION_LAYER = "INTERSECTIONS"  # Single layer for all intersection lines
-SNAP_TOLERANCE = 0.1  # Snap if intersection vertex is within 1 cm (for example)
+TIN_RESOLUTION = 10    # Not strictly used in this example, but left for context
+INTERSECTION_LAYER = "INTERSECTIONS"
+SNAP_TOLERANCE = 0.1   # e.g., 0.1 units for snapping
 
+###############################################################################
+# STEP 1: READ DXF CONTOURS
+###############################################################################
 
 def read_dxf_contours(file_path):
     """
     Reads contours from a DXF file and returns them grouped by layer.
-    Each layer is treated as a separate surface.
-    Recognizes both LWPOLYLINE and 3D POLYLINE entities.
+    Recognizes both LWPOLYLINE (2D + elevation) and 3D POLYLINE entities.
     """
     print(f"[DEBUG] Reading DXF file: {file_path}")
     doc = ezdxf.readfile(file_path)
@@ -30,7 +33,7 @@ def read_dxf_contours(file_path):
     for entity in msp:
         found_entities += 1
 
-        # Handle LWPOLYLINE (usually 2D with an elevation)
+        # Handle LWPOLYLINE
         if entity.dxftype() == "LWPOLYLINE":
             layer_name = entity.dxf.layer
             found_layers.add(layer_name)
@@ -39,8 +42,7 @@ def read_dxf_contours(file_path):
             elevation = entity.dxf.elevation
             coords = [(p[0], p[1], elevation) for p in entity.get_points()]
             contours[layer_name].append(coords)
-            print(f"[DEBUG]   Found LWPOLYLINE in layer '{layer_name}' with elevation {elevation} "
-                  f"and {len(coords)} points.")
+            print(f"[DEBUG]   Found LWPOLYLINE in layer '{layer_name}' with elevation={elevation} and {len(coords)} pts.")
 
         # Handle 3D POLYLINE
         elif entity.dxftype() == "POLYLINE" and entity.is_3d_polyline:
@@ -50,174 +52,351 @@ def read_dxf_contours(file_path):
                 contours[layer_name] = []
             coords = [
                 (
-                    v.get_dxf_attrib("location").x,
-                    v.get_dxf_attrib("location").y,
-                    v.get_dxf_attrib("location").z
+                    v.dxf.location.x,
+                    v.dxf.location.y,
+                    v.dxf.location.z
                 )
                 for v in entity.vertices
             ]
             contours[layer_name].append(coords)
-            print(f"[DEBUG]   Found 3D POLYLINE in layer '{layer_name}' with {len(coords)} points.")
+            print(f"[DEBUG]   Found 3D POLYLINE in layer '{layer_name}' with {len(coords)} pts.")
 
+        # Skip others
         else:
-            # Skipped unsupported entity types
             pass
 
-    print(f"\n[DEBUG] Total layers in DXF: {len(found_layers)}")
-    for layer in found_layers:
-        print(f"[DEBUG]   Layer '{layer}' processed.")
-
+    print(f"\n[DEBUG] Total layers in DXF: {len(found_layers)} => {found_layers}")
     print(f"[DEBUG] Total entities in DXF: {found_entities}")
-    print(f"[DEBUG] Total valid contours: {len(contours)}")
+    print(f"[DEBUG] Total valid contour layers: {len(contours)}")
     return contours
 
 
+###############################################################################
+# STEP 2: GENERATE TIN FROM CONTOURS (for intersection)
+###############################################################################
+
 def generate_tin_from_contours(contours):
     """
-    Creates TIN surfaces using contour points for each surface layer.
-    Returns a dictionary of TIN meshes (for intersection computation).
+    Creates TIN surfaces for each layer. We use XY for triangulation via scipy.spatial.Delaunay.
+    Returns a dict: { layer_name: {"points": points, "triangles": simplices}, ... }
     """
     tins = {}
     for layer, layer_contours in contours.items():
         print(f"[DEBUG] Generating TIN for layer '{layer}'...")
-        # Flatten all lines within this layer into a single point array
-        points = np.array([point for contour_line in layer_contours for point in contour_line])
+        points = np.array([pt for contour_line in layer_contours for pt in contour_line])
         if len(points) < 3:
-            print(f"[DEBUG]   Warning: Layer '{layer}' has fewer than 3 points, skipping TIN generation.")
+            print(f"[DEBUG]   Layer '{layer}' has fewer than 3 pts, skipping.")
             continue
 
-        xy = points[:, :2]  # Use X, Y for triangulation
+        xy = points[:, :2]
         tri = Delaunay(xy)
         tins[layer] = {
             "points": points,
-            "triangles": tri.simplices,
+            "triangles": tri.simplices
         }
-        print(f"[DEBUG]   TIN generated for layer '{layer}' with {len(tri.simplices)} triangles "
-              f"and {len(points)} points.")
+        print(f"[DEBUG]   TIN built with {len(tri.simplices)} triangles / {len(points)} pts in layer '{layer}'.")
     return tins
 
 
+###############################################################################
+# STEP 3: INTERSECTION LINES (using PyVista)
+###############################################################################
+
 def calculate_intersection_lines(tins):
     """
-    Calculates 3D intersection lines between TIN surfaces using PyVista's intersection filter.
-    Returns a list of shapely LineString objects in 3D.
+    Calculate 3D intersection lines between each pair of TIN surfaces.
+    Return list of shapely LineStrings (3D).
     """
-    print("[DEBUG] Calculating intersection lines between surfaces...")
-    intersections = []
+    print("[DEBUG] Calculating intersection lines between TIN surfaces...")
     layers = list(tins.keys())
+    intersections = []
 
-    # Compare each layer with subsequent layers
-    for i, layer1 in enumerate(layers):
-        for layer2 in layers[i + 1:]:
-            print(f"[DEBUG]   Checking intersection between '{layer1}' and '{layer2}'...")
-            points1, triangles1 = tins[layer1]["points"], tins[layer1]["triangles"]
-            points2, triangles2 = tins[layer2]["points"], tins[layer2]["triangles"]
+    for i in range(len(layers)):
+        for j in range(i + 1, len(layers)):
+            layer1, layer2 = layers[i], layers[j]
+            print(f"[DEBUG]   Checking intersection: '{layer1}' vs '{layer2}'")
 
-            # Create PyVista meshes for both TIN surfaces
-            mesh1 = pv.PolyData(points1)
-            mesh1.faces = np.hstack([[3] + list(tri) for tri in triangles1])
-            mesh2 = pv.PolyData(points2)
-            mesh2.faces = np.hstack([[3] + list(tri) for tri in triangles2])
+            pts1 = tins[layer1]["points"]
+            tri1 = tins[layer1]["triangles"]
+            pts2 = tins[layer2]["points"]
+            tri2 = tins[layer2]["triangles"]
 
-            # Calculate intersection lines using PyVista
-            intersection_line, _, _ = mesh1.intersection(
-                mesh2,
-                split_first=False,   # Only the intersection line
-                split_second=False
-            )
+            mesh1 = pv.PolyData(pts1)
+            mesh1.faces = np.hstack([[3] + list(t) for t in tri1])
+            mesh2 = pv.PolyData(pts2)
+            mesh2.faces = np.hstack([[3] + list(t) for t in tri2])
+
+            intersection_line, _, _ = mesh1.intersection(mesh2, split_first=False, split_second=False)
 
             if isinstance(intersection_line, pv.PolyData):
-                print(f"[DEBUG]   Intersection result has {intersection_line.n_points} points "
-                      f"and {intersection_line.n_cells} cells.")
                 if intersection_line.n_points > 1:
-                    # Each cell is typically a "line" in the intersection
+                    print(f"[DEBUG]     => Intersection: {intersection_line.n_points} pts, {intersection_line.n_cells} lines.")
                     for cidx in range(intersection_line.n_cells):
                         cell = intersection_line.extract_cells(cidx)
                         if cell.n_points > 1:
-                            coords = np.array(cell.points)
-                            # Create a 3D shapely LineString
-                            line_3d = LineString(coords)
-                            intersections.append(line_3d)
+                            arr = np.array(cell.points)
+                            intersections.append(LineString(arr))
 
     print(f"[DEBUG] Total intersection lines found: {len(intersections)}")
     return intersections
 
 
-def snap_intersections_to_contours(
-    intersections,
-    contours,
-    tolerance=SNAP_TOLERANCE
-):
-    """
-    For each vertex in each intersection line, snap it to the nearest point 
-    on the closest original contour line if within the given tolerance.
+###############################################################################
+# STEP 3A: SNAP INTERSECTION LINES TO NEAREST ORIGINAL CONTOUR
+###############################################################################
 
-    :param intersections: List of shapely LineString objects.
-    :param contours: Dictionary of layer -> list_of_lines -> coordinates.
-    :param tolerance: Maximum distance to perform snapping.
-    :return: A new list of LineStrings with snapped coordinates.
-    """
-    print("[DEBUG] Starting snapping process using manual nearest line search...")
-    print(f"[DEBUG]   Tolerance: {tolerance}")
+from shapely.geometry import Point
 
-    # 1) Build a list of all original contour lines as Shapely LineString objects.
+def snap_intersections_to_contours(intersections, contours, tolerance=SNAP_TOLERANCE):
+    """
+    Snaps each vertex of the intersection lines to the nearest original contour
+    line if within 'tolerance'. Returns new snapped intersection lines.
+    """
+    print("[DEBUG] Snapping intersection lines to original contours. Tolerance =", tolerance)
+    # Build shapely lines from all original contours
     original_lines = []
-    for layer_name, lines in contours.items():
-        for line_coords in lines:
-            # Convert each contour line to a Shapely LineString.
-            original_lines.append(LineString(line_coords))
-    print(f"[DEBUG]   Total original contour lines: {len(original_lines)}")
+    for layer, lines in contours.items():
+        for coords in lines:
+            original_lines.append(LineString(coords))
 
-    snapped_intersections = []
-    total_snap_count = 0
-    line_index = 0
-
-    # 2) Process each intersection line.
-    for line in intersections:
-        line_index += 1
+    snapped = []
+    total_snapped = 0
+    for idx, line in enumerate(intersections, start=1):
         coords = list(line.coords)
         new_coords = []
-        snap_count_line = 0
+        snap_count = 0
 
-        print(f"[DEBUG] - Processing intersection line #{line_index} with {len(coords)} points.")
-        # 3) For each vertex in the intersection line:
-        for j, pt in enumerate(coords):
-            # Create a Shapely point from the current vertex.
-            point = Point(pt[:2])  # Use X, Y for projection.
+        for pt in coords:
+            p2d = Point(pt[:2])
+            min_d = float("inf")
+            best_line = None
+            for candidate_line in original_lines:
+                d = candidate_line.distance(p2d)
+                if d < min_d:
+                    min_d = d
+                    best_line = candidate_line
 
-            # 4) Manually find the nearest original line.
-            min_dist = float('inf')
-            nearest_line = None
-            for candidate in original_lines:
-                d = point.distance(candidate)
-                if d < min_dist:
-                    min_dist = d
-                    nearest_line = candidate
-            distance = min_dist
-
-            # 5) If within tolerance, project the point onto the nearest line.
-            if distance < tolerance and nearest_line is not None:
-                projected = nearest_line.interpolate(nearest_line.project(point))
-                # Preserve original Z if available.
-                z_val = pt[2] if len(pt) > 2 else 0.0
-                snapped_pt = (projected.x, projected.y, z_val)
-                new_coords.append(snapped_pt)
-                snap_count_line += 1
-                print(f"[DEBUG]   Snapped point {j} from {pt} to {snapped_pt} (dist={distance:.6f})")
+            if min_d < tolerance and best_line is not None:
+                # Project onto best_line
+                proj = best_line.interpolate(best_line.project(p2d))
+                z_val = pt[2] if len(pt) > 2 else 0
+                new_coords.append((proj.x, proj.y, z_val))
+                snap_count += 1
             else:
                 new_coords.append(pt)
-                print(f"[DEBUG]   Point {j} not snapped, distance {distance:.6f} exceeds tolerance.")
 
-        total_snap_count += snap_count_line
-        print(f"[DEBUG] - End of line #{line_index}, snapped {snap_count_line} points.")
+        total_snapped += snap_count
+        snapped.append(LineString(new_coords))
+        print(f"[DEBUG]   Intersection #{idx}: snapped {snap_count} points.")
 
-        # 6) Create a new LineString with the snapped coordinates.
-        snapped_intersections.append(LineString(new_coords))
-
-    print(f"[DEBUG] Finished snapping. Total snapped points across all lines: {total_snap_count}")
-    return snapped_intersections
+    print(f"[DEBUG] Total snapped points across all intersection lines: {total_snapped}")
+    return snapped
 
 
+###############################################################################
+# STEP 4: COMBINE ALL LINES AND POLYGONIZE
+###############################################################################
+
+from shapely.ops import linemerge, unary_union, polygonize
+
+def build_planar_polygons(contours, snapped_intersections):
+    """
+    Combine original contour lines + intersection lines in 2D, polygonize them,
+    and return a list of Shapely polygons.
+    """
+    print("[DEBUG] Building planar polygons from lines...")
+
+    # 1) Gather all lines in 2D (ignore Z for polygonization)
+    all_lines_2d = []
+    # Original contour lines
+    for layer, lines in contours.items():
+        for coords in lines:
+            coords_2d = [(x, y) for (x, y, z) in coords]
+            all_lines_2d.append(LineString(coords_2d))
+    # Snapped intersection lines
+    for line in snapped_intersections:
+        coords_2d = [(x, y) for (x, y, z) in line.coords]
+        all_lines_2d.append(LineString(coords_2d))
+
+    # 2) Merge into a single MultiLineString
+    merged = unary_union(all_lines_2d)
+    # 3) Polygonize
+    polys = list(polygonize(merged))
+
+    print(f"[DEBUG] => Found {len(polys)} polygons from polygonize().")
+    return polys
+
+
+###############################################################################
+# STEP 5: FIND WHICH TIN IS LOWEST FOR EACH POLYGON
+###############################################################################
+
+def interpolate_tin_z(x, y, tin):
+    """
+    Simple method: find nearest triangle from 'tin' and do a barycentric interpolation
+    to get approximate Z at (x, y). If outside hull or no triangle, return None.
+
+    This is a DEMO approach. Production code might need robust point-in-triangle tests.
+    """
+    points = tin["points"]
+    tri = tin["triangles"]
+
+    # Quick nearest search: we loop over triangles to see if (x,y) is in that triangle's XY plane
+    # For large data, a spatial index or advanced library is recommended.
+    for simplex in tri:
+        p0 = points[simplex[0]]
+        p1 = points[simplex[1]]
+        p2 = points[simplex[2]]
+
+        # We'll work in XY for the 2D test
+        x0, y0 = p0[0], p0[1]
+        x1, y1 = p1[0], p1[1]
+        x2, y2 = p2[0], p2[1]
+
+        # Barycentric approach: Check if (x,y) inside triangle [ (x0,y0), (x1,y1), (x2,y2) ]
+        denom = (y1 - y2)*(x0 - x2) + (x2 - x1)*(y0 - y2)
+        if abs(denom) < 1e-12:
+            # Degenerate triangle?
+            continue
+
+        a = ((y1 - y2)*(x - x2) + (x2 - x1)*(y - y2)) / denom
+        b = ((y2 - y0)*(x - x2) + (x0 - x2)*(y - y2)) / denom
+        c = 1 - a - b
+
+        # If 0 <= a,b,c <= 1 => inside
+        if (a >= 0) and (b >= 0) and (c >= 0):
+            # Interpolate Z
+            z0, z1, z2 = p0[2], p1[2], p2[2]
+            z = a*z0 + b*z1 + c*z2
+            return z
+    # Not found
+    return None
+
+def label_polygons_with_lowest_tin(polygons, tins):
+    """
+    For each polygon, compute its centroid (x,y). Interpolate Z from each TIN.
+    Label polygon with the layer name having the minimal Z. Return a list of (polygon, layer).
+    """
+    print("[DEBUG] Labeling polygons with their lowest TIN surface...")
+    labeled = []
+    layer_names = list(tins.keys())
+
+    for i, poly in enumerate(polygons, start=1):
+        if poly.is_empty:
+            continue
+        center = poly.centroid
+        xC, yC = center.x, center.y
+
+        best_layer = None
+        best_z = None
+
+        for layer in layer_names:
+            z_val = interpolate_tin_z(xC, yC, tins[layer])
+            if z_val is not None:
+                if (best_z is None) or (z_val < best_z):
+                    best_z = z_val
+                    best_layer = layer
+
+        if best_layer is not None:
+            labeled.append((poly, best_layer))
+        else:
+            # If the polygon doesn't lie within any TIN's boundary
+            labeled.append((poly, "NO_TIN"))
+
+        print(f"  Polygon #{i} => lowest = {best_layer}")
+
+    return labeled
+
+
+###############################################################################
+# STEP 6: MERGE ADJACENT POLYGONS WITH THE SAME TIN
+###############################################################################
+
+from shapely.ops import unary_union
+
+def merge_polygons_by_tin(labeled_polys):
+    """
+    Merge polygons that share an edge and have the same TIN label.
+    Returns a dict: { layer_name: MultiPolygon or Polygon } for each TIN.
+    """
+    print("[DEBUG] Merging adjacent polygons that share the same TIN label...")
+    # Group by layer
+    from collections import defaultdict
+    grouping = defaultdict(list)
+    for poly, layer in labeled_polys:
+        grouping[layer].append(poly)
+
+    # Merge within each layer
+    merged_result = {}
+    for layer, polys in grouping.items():
+        # unary_union merges all polygons in that layer
+        merged_poly = unary_union(polys)
+        merged_result[layer] = merged_poly
+        print(f"[DEBUG]   {len(polys)} polygons merged into one geometry for layer '{layer}'")
+
+    return merged_result
+
+
+
+
+###############################################################################
+# EXPORT FINAL POLYGONS (OPTIONAL)
+###############################################################################
+
+def export_final_polygons(dxf_file, contours, intersection_lines, merged_dict):
+    """
+    Export:
+      1) Original lines (as is)
+      2) Intersection lines (on INTERSECTION_LAYER)
+      3) Merged polygons for each TIN label
+    """
+    print("[DEBUG] Exporting final results to DXF:", dxf_file)
+    doc = ezdxf.new()
+    msp = doc.modelspace()
+
+    # 1) Original lines on their layers
+    for layer_name, lines in contours.items():
+        for coords in lines:
+            msp.add_polyline3d(coords, dxfattribs={"layer": layer_name})
+
+    # 2) Intersection lines on INTERSECTION_LAYER
+    for i, line in enumerate(intersection_lines, start=1):
+        coords = list(line.coords)
+        msp.add_polyline3d(coords, dxfattribs={"layer": INTERSECTION_LAYER})
+
+    # 3) Merged polygons: we can flatten them to 2D polylines or export as 3D with Z=0
+    # Each TIN label => new layer
+    for layer_label, geom in merged_dict.items():
+        # geom could be Polygon or MultiPolygon
+        # We'll unify the logic by ensuring we iterate over polygons.
+        if geom.is_empty:
+            continue
+
+        # shapely can have multiple polygons inside a MultiPolygon
+        if geom.geom_type == "Polygon":
+            polygons = [geom]
+        elif geom.geom_type == "MultiPolygon":
+            polygons = list(geom.geoms)
+        else:
+            polygons = []
+
+        for poly in polygons:
+            if poly.is_empty:
+                continue
+            # For each polygon, add a closed polyline in 2D (Z=0).
+            xys = list(poly.exterior.coords)
+            # convert them to 3D with Z=0
+            coords_3d = [(x, y, 0.0) for (x, y) in xys]
+            msp.add_polyline3d(coords_3d, dxfattribs={"layer": f"FINAL_{layer_label}"})
+
+            # If the polygon has holes (interiors), optionally export them too
+            for interior in poly.interiors:
+                xys_int = list(interior.coords)
+                coords_int_3d = [(x, y, 0.0) for (x, y) in xys_int]
+                msp.add_polyline3d(coords_int_3d, dxfattribs={"layer": f"FINAL_{layer_label}_HOLE"})
+
+    doc.saveas(dxf_file)
+    print("[DEBUG] DXF export complete.")
 
 def visualize_tins(tins, intersections=None):
     """
@@ -251,69 +430,49 @@ def visualize_tins(tins, intersections=None):
     plotter.show()
 
 
-def export_to_dxf(contours, intersections, output_path):
-    """
-    Exports the original contour polylines (as read) plus the intersection lines
-    into a single DXF file.
-    """
-    print("[DEBUG] Exporting results to DXF...")
-    doc = ezdxf.new()
-    msp = doc.modelspace()
 
-    # 1) Export the original polylines exactly as read
-    print(f"[DEBUG]   Exporting original contour lines to DXF...")
-    for layer_name, list_of_lines in contours.items():
-        for line_coords in list_of_lines:
-            # 3D polylines for original
-            msp.add_polyline3d(
-                line_coords,
-                dxfattribs={"layer": layer_name}
-            )
-
-    # 2) Export intersection lines to a single layer
-    print(f"[DEBUG]   Exporting {len(intersections)} intersection lines to layer '{INTERSECTION_LAYER}'...")
-    for idx, line in enumerate(intersections):
-        coords = list(line.coords)
-        msp.add_polyline3d(
-            coords,
-            dxfattribs={"layer": INTERSECTION_LAYER}
-        )
-
-    doc.saveas(output_path)
-    print(f"[DEBUG] DXF file saved: {output_path}")
-
+###############################################################################
+# MAIN WORKFLOW
+###############################################################################
 
 def main():
-    # Step 1: Read DXF contours
-    print("[DEBUG] Step 1: Reading contours from DXF...")
+    # 1) Read DXF contours
+    print("[DEBUG] Step 1: Reading contours...")
     contours = read_dxf_contours(INPUT_DXF)
 
-    # Step 2: Generate TIN surfaces (for intersection, but not re-exported)
+    # 2) Generate TIN surfaces
     print("\n[DEBUG] Step 2: Generating TIN surfaces...")
     tins = generate_tin_from_contours(contours)
 
-    # Step 3: Calculate intersection lines
+    # 3) Calculate intersection lines
     print("\n[DEBUG] Step 3: Calculating intersection lines...")
     intersections = calculate_intersection_lines(tins)
 
-    # Step 3a: Snap intersections to original contours
+    # 3a) Snap intersection lines to original contours
     print("\n[DEBUG] Step 3a: Snapping intersection lines to original contours...")
-    snapped_intersections = snap_intersections_to_contours(
-        intersections, 
-        contours, 
-        tolerance=SNAP_TOLERANCE
-    )
+    snapped_intersections = snap_intersections_to_contours(intersections, contours, tolerance=SNAP_TOLERANCE)
 
-    # Step 4: Visualize TINs and Intersections (optional)
-    print("\n[DEBUG] Step 4: Visualizing TIN surfaces and (snapped) intersections...")
+    # 4) Build planar polygons from all lines
+    print("\n[DEBUG] Step 4: Building planar polygons from lines (original + intersection)...")
+    polygons = build_planar_polygons(contours, snapped_intersections)
+
+    # 5) Determine which TIN is lowest for each polygon
+    print("\n[DEBUG] Step 5: Label each polygon with its lowest TIN surface...")
+    labeled_polys = label_polygons_with_lowest_tin(polygons, tins)
+
+    # 6) Merge adjacent polygons that share the same TIN label
+    print("\n[DEBUG] Step 6: Merge polygons by TIN label...")
+    merged_by_tin = merge_polygons_by_tin(labeled_polys)
+
+    # 8) Visualize everything in 3D 
     visualize_tins(tins, snapped_intersections)
 
-    # Step 5: Export to DXF (original lines + intersection lines)
-    print("\n[DEBUG] Step 5: Exporting results to DXF...")
+    # 7) Export results
+    print("\n[DEBUG] Step 7: Export results to DXF...")
     os.makedirs(os.path.dirname(OUTPUT_DXF), exist_ok=True)
-    export_to_dxf(contours, snapped_intersections, OUTPUT_DXF)
+    export_final_polygons(OUTPUT_DXF, contours, snapped_intersections, merged_by_tin)
 
-    print("\n[DEBUG] Process complete. Results saved to:", OUTPUT_DXF)
+    print(f"\n[DEBUG] Workflow complete. Results saved to '{OUTPUT_DXF}'.")
 
 
 if __name__ == "__main__":
