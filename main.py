@@ -3,11 +3,11 @@ import numpy as np
 from scipy.spatial import Delaunay
 import ezdxf
 from shapely.geometry import LineString, Point, Polygon
-from shapely.ops import polygonize, unary_union, linemerge, cascaded_union
+from shapely.ops import polygonize, unary_union
 import pyvista as pv
 
 # Constants
-INPUT_DXF = "test2.dxf"
+INPUT_DXF = "test55.dxf"
 OUTPUT_DXF = "output/lowest_zones.dxf"
 TIN_RESOLUTION = 10
 INTERSECTION_LAYER = "INTERSECTIONS"
@@ -19,10 +19,6 @@ DECIMATION_REDUCTION = 0.0
 ###############################################################################
 
 def read_dxf_contours(file_path):
-    """
-    Reads contours from a DXF file, enforces closed polygons, and returns them grouped by layer.
-    Recognizes both LWPOLYLINE (2D + elevation) and 3D POLYLINE entities.
-    """
     print(f"[DEBUG] Reading DXF file: {file_path}")
     doc = ezdxf.readfile(file_path)
     msp = doc.modelspace()
@@ -67,7 +63,7 @@ def read_dxf_contours(file_path):
     return contours
 
 ###############################################################################
-# STEP 2: GENERATE TIN FROM CONTOURS (for intersection)
+# STEP 2: GENERATE TIN FROM CONTOURS
 ###############################################################################
 
 def generate_tin_from_contours(contours):
@@ -80,25 +76,88 @@ def generate_tin_from_contours(contours):
             continue
 
         xy = points[:, :2]
-        tri = Delaunay(xy)
-        tins[layer] = {"points": points, "triangles": tri.simplices}
-        print(f"[DEBUG]   TIN built with {len(tri.simplices)} triangles / {len(points)} pts in layer '{layer}'.")
+        try:
+            tri = Delaunay(xy)
+            tins[layer] = {"points": points, "triangles": tri.simplices}
+            print(f"[DEBUG]   TIN built with {len(tri.simplices)} triangles / {len(points)} pts in layer '{layer}'.")
+        except Exception as e:
+            print(f"[ERROR]   Failed to build TIN for layer '{layer}': {e}")
     return tins
 
 ###############################################################################
-# VISUALIZE INITIAL (UNMODIFIED) TINS
+# UTILITY: COMPUTE GLOBAL Z-SCALE BASED ON EXTENTS
 ###############################################################################
 
-def visualize_initial_tins(tins):
-    print("[DEBUG] Visualizing initial TIN surfaces...")
+def compute_global_z_scale(tins):
+    all_points = np.concatenate([tin["points"] for tin in tins.values()])
+    xrange = all_points[:,0].max() - all_points[:,0].min()
+    yrange = all_points[:,1].max() - all_points[:,1].min()
+    zrange = all_points[:,2].max() - all_points[:,2].min()
+    planar = max(xrange, yrange)
+    scale = planar / zrange if zrange != 0 else 1
+    print(f"[DEBUG] Global Z-scale computed: {scale}")
+    return scale
+
+###############################################################################
+# VISUALIZE TINS WITH CHECKBOXES, AUTO Z-SCALE, LEGENDS, AND INTERSECTIONS
+###############################################################################
+
+def visualize_tins_with_checkboxes(tins, intersections=None, global_scale=1.0):
+    """
+    Visualizes TIN surfaces with checkboxes to toggle visibility, auto Z-scale,
+    legends next to checkboxes, and optionally intersection lines.
+    """
+    print("[DEBUG] Visualizing TIN surfaces with checkboxes and legends...")
     plotter = pv.Plotter()
-    for layer, tin in tins.items():
-        points = tin["points"]
+    actors = {}
+    checkbox_positions = {}
+    legend_labels = {}
+    
+    # Determine starting positions for checkboxes and legends
+    start_y = 10
+    dy = 30
+    x_pos = 10
+    legend_offset = 25  # horizontal offset for legend text
+
+    for idx, (layer, tin) in enumerate(tins.items()):
+        points = tin["points"].copy()
+        # Apply global Z-scale uniformly
+        points[:,2] *= global_scale  
+
         triangles = tin["triangles"]
         mesh = pv.PolyData(points)
         mesh.faces = np.hstack([[3] + list(tri) for tri in triangles])
-        mesh["Elevation"] = points[:, 2]
-        plotter.add_mesh(mesh, show_edges=True, scalars="Elevation", cmap="viridis", label=layer)
+        
+        # Explicitly set the "Elevation" array on the mesh's points
+        mesh.point_data["Elevation"] = points[:, 2]
+
+        actor = plotter.add_mesh(mesh, show_edges=True, scalars="Elevation", cmap="viridis", label=layer)
+        actors[layer] = actor
+
+        # Set position for checkbox widget
+        position = (x_pos, start_y + idx * dy)
+        checkbox_positions[layer] = position
+
+        # Store legend label position (right to the checkbox)
+        legend_labels[layer] = (x_pos + legend_offset, start_y + idx * dy)
+
+    # Add checkboxes and legends
+    for layer, actor in actors.items():
+        def callback(checked, actor=actor):
+            actor.SetVisibility(checked)
+        pos = checkbox_positions[layer]
+        plotter.add_checkbox_button_widget(callback=callback, value=True, position=pos, size=20)
+        legend_pos = legend_labels[layer]
+        plotter.add_text(layer, position=legend_pos, font_size=12, color='white', shadow=True)
+
+    # Add intersection lines if provided, using global_scale for Z-axis
+    if intersections:
+        for line in intersections:
+            coords = np.array(line.coords)
+            if coords.shape[0] > 1:
+                coords[:,2] *= global_scale
+                plotter.add_lines(coords, color="red", width=2)
+
     plotter.add_legend()
     plotter.show()
 
@@ -126,38 +185,58 @@ def decimate_all_tins(tins, reduction=0.3):
     return decimated_tins
 
 ###############################################################################
-# STEP 3: INTERSECTION LINES (using *DECIMATED* TIN surfaces) (unchanged)
+# STEP 3: INTERSECTION LINES (using *DECIMATED* TIN surfaces)
 ###############################################################################
 
 def calculate_intersection_lines(decimated_tins):
     print("[DEBUG] Calculating intersection lines between decimated TIN surfaces...")
     layers = list(decimated_tins.keys())
     intersections = []
+    total_pairs = len(layers) * (len(layers) - 1) // 2
+    processed_pairs = 0
+    valid_intersections = 0
+
     for i in range(len(layers)):
         for j in range(i + 1, len(layers)):
             layer1, layer2 = layers[i], layers[j]
-            print(f"[DEBUG]   Checking intersection: '{layer1}' vs '{layer2}'")
+            processed_pairs += 1
+            print(f"[DEBUG]   Processing pair {processed_pairs}/{total_pairs}: '{layer1}' vs '{layer2}'")
             pts1 = decimated_tins[layer1]["points"]
             tri1 = decimated_tins[layer1]["triangles"]
             pts2 = decimated_tins[layer2]["points"]
             tri2 = decimated_tins[layer2]["triangles"]
+
             mesh1 = pv.PolyData(pts1)
             mesh1.faces = np.hstack([[3] + list(t) for t in tri1])
             mesh2 = pv.PolyData(pts2)
             mesh2.faces = np.hstack([[3] + list(t) for t in tri2])
-            intersection_line, _, _ = mesh1.intersection(mesh2, split_first=False, split_second=False)
-            if isinstance(intersection_line, pv.PolyData) and intersection_line.n_points > 1:
-                print(f"[DEBUG]     => Intersection: {intersection_line.n_points} pts, {intersection_line.n_cells} lines.")
-                for cidx in range(intersection_line.n_cells):
-                    cell = intersection_line.extract_cells(cidx)
-                    if cell.n_points > 1:
-                        arr = np.array(cell.points)
-                        intersections.append(LineString(arr))
-    print(f"[DEBUG] Total intersection lines found: {len(intersections)}")
+
+            # Check for collision before attempting intersection
+            collision_result = mesh1.collision(mesh2, box_tolerance=1e-5)
+            # Unpack collision result: (collision_mesh, n_collisions)
+            collision, ncol = collision_result
+            if ncol == 0:
+                print(f"[DEBUG]     => No collision detected between '{layer1}' and '{layer2}'. Skipping intersection.")
+                continue
+
+            try:
+                intersection_line, _, _ = mesh1.intersection(mesh2, split_first=False, split_second=False)
+                if isinstance(intersection_line, pv.PolyData) and intersection_line.n_points > 1:
+                    print(f"[DEBUG]     => Valid intersection found: {intersection_line.n_points} pts, {intersection_line.n_cells} lines.")
+                    for cidx in range(intersection_line.n_cells):
+                        cell = intersection_line.extract_cells(cidx)
+                        if cell.n_points > 1:
+                            arr = np.array(cell.points)
+                            intersections.append(LineString(arr))
+                            valid_intersections += 1
+            except Exception as e:
+                print(f"[ERROR]     => Failed to compute intersection between '{layer1}' and '{layer2}': {e}")
+
+    print(f"[DEBUG] Total intersection lines found: {valid_intersections}")
     return intersections
 
 ###############################################################################
-# STEP 3A: SNAP INTERSECTION LINES TO NEAREST ORIGINAL CONTOUR (unchanged)
+# STEP 3A: SNAP INTERSECTION LINES TO NEAREST ORIGINAL CONTOUR
 ###############################################################################
 
 def snap_intersections_to_contours(intersections, contours, tolerance=SNAP_TOLERANCE):
@@ -166,9 +245,10 @@ def snap_intersections_to_contours(intersections, contours, tolerance=SNAP_TOLER
     for layer, lines in contours.items():
         for coords in lines:
             original_lines.append(LineString(coords))
+    
     snapped = []
     total_snapped = 0
-    for idx, line in enumerate(intersections, start=1):
+    for line in intersections:
         coords = list(line.coords)
         new_coords = []
         snap_count = 0
@@ -190,12 +270,13 @@ def snap_intersections_to_contours(intersections, contours, tolerance=SNAP_TOLER
                 new_coords.append(pt)
         total_snapped += snap_count
         snapped.append(LineString(new_coords))
-        print(f"[DEBUG]   Intersection #{idx}: snapped {snap_count} points.")
+    
+    print(f"[DEBUG] Total intersection lines processed: {len(intersections)}")
     print(f"[DEBUG] Total snapped points across all intersection lines: {total_snapped}")
     return snapped
 
 ###############################################################################
-# STEP 4: COMBINE ALL LINES AND POLYGONIZE with Detailed Debugging (unchanged)
+# STEP 4: COMBINE ALL LINES AND POLYGONIZE
 ###############################################################################
 
 def build_planar_polygons(contours, snapped_intersections):
@@ -263,7 +344,7 @@ def visualize_polygons(polygons):
     plotter.show()
 
 ###############################################################################
-# STEP 5: FIND WHICH TIN IS LOWEST FOR EACH POLYGON (unchanged)
+# STEP 5: FIND WHICH TIN IS LOWEST FOR EACH POLYGON
 ###############################################################################
 
 def interpolate_tin_z(x, y, tin):
@@ -312,7 +393,7 @@ def label_polygons_with_lowest_tin(polygons, tins):
     return labeled
 
 ###############################################################################
-# STEP 6: MERGE ADJACENT POLYGONS WITH THE SAME TIN (unchanged)
+# STEP 6: MERGE ADJACENT POLYGONS WITH THE SAME TIN
 ###############################################################################
 
 from shapely.ops import unary_union
@@ -331,7 +412,7 @@ def merge_polygons_by_tin(labeled_polys):
     return merged_result
 
 ###############################################################################
-# EXPORT FINAL POLYGONS (unchanged)
+# EXPORT FINAL POLYGONS
 ###############################################################################
 
 def export_final_polygons(dxf_file, contours, intersection_lines, merged_dict):
@@ -370,28 +451,6 @@ def export_final_polygons(dxf_file, contours, intersection_lines, merged_dict):
     print("[DEBUG] DXF export complete.")
 
 ###############################################################################
-# VISUALIZE TINS (unchanged)
-###############################################################################
-
-def visualize_tins(tins, intersections=None):
-    print("[DEBUG] Visualizing final (decimated) TIN surfaces...")
-    plotter = pv.Plotter()
-    for layer, tin in tins.items():
-        points = tin["points"]
-        triangles = tin["triangles"]
-        mesh = pv.PolyData(points)
-        mesh.faces = np.hstack([[3] + list(tri) for tri in triangles])
-        mesh["Elevation"] = points[:, 2]
-        plotter.add_mesh(mesh, show_edges=True, scalars="Elevation", cmap="viridis", label=layer)
-    if intersections:
-        for line in intersections:
-            coords = np.array(line.coords)
-            if coords.shape[0] > 1:
-                plotter.add_lines(coords, color="red", width=2)
-    plotter.add_legend()
-    plotter.show()
-
-###############################################################################
 # MAIN WORKFLOW
 ###############################################################################
 
@@ -402,19 +461,36 @@ def main():
     print("\n[DEBUG] Step 2: Generating TIN surfaces...")
     tins = generate_tin_from_contours(contours)
 
-    visualize_initial_tins(tins)
+    if not tins:
+        print("[ERROR] No valid TINs generated. Exiting.")
+        return
 
-    # For debugging, decimation is disabled
-    decimated_tins = tins
+    # Compute global Z-scale
+    global_scale = compute_global_z_scale(tins)
+
+    # Initial visualization with checkboxes
+    visualize_tins_with_checkboxes(tins, global_scale=global_scale)
+
+    # Decimate TINs if needed
+    decimated_tins = decimate_all_tins(tins, reduction=DECIMATION_REDUCTION)
 
     print("\n[DEBUG] Step 3: Calculating intersection lines...")
     intersections = calculate_intersection_lines(decimated_tins)
+
+    if not intersections:
+        print("[DEBUG] No valid intersection lines found.")
+    else:
+        print(f"[DEBUG] Total valid intersections after computation: {len(intersections)}")
 
     print("\n[DEBUG] Step 3a: Snapping intersection lines to original contours...")
     snapped_intersections = snap_intersections_to_contours(intersections, contours, tolerance=SNAP_TOLERANCE)
 
     print("\n[DEBUG] Step 4: Building planar polygons from lines (original + intersection)...")
     polygons = build_planar_polygons(contours, snapped_intersections)
+
+    if not polygons:
+        print("[DEBUG] No polygons were created. Exiting.")
+        return
 
     visualize_polygons(polygons)
 
@@ -424,8 +500,8 @@ def main():
     print("\n[DEBUG] Step 6: Merge polygons by TIN label...")
     merged_by_tin = merge_polygons_by_tin(labeled_polys)
 
-    print("\n[DEBUG] Visualizing final TINs with intersections...")
-    visualize_tins(decimated_tins, snapped_intersections)
+    print("\n[DEBUG] Visualizing final TINs with intersections, checkboxes, and legends...")
+    visualize_tins_with_checkboxes(decimated_tins, intersections=snapped_intersections, global_scale=global_scale)
 
     print("\n[DEBUG] Step 7: Export results to DXF...")
     os.makedirs(os.path.dirname(OUTPUT_DXF), exist_ok=True)
