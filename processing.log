@@ -1,0 +1,59 @@
+2025-01-21 14:27:41,489 DEBUG:Step 1: Reading contours...
+2025-01-21 14:27:41,490 DEBUG:Reading DXF file: test.dxf
+2025-01-21 14:27:44,166 DEBUG:  Found 3D POLYLINE in layer 'AUX_GP IAT' with 4 pts.
+2025-01-21 14:27:44,166 DEBUG:  Found LWPOLYLINE in layer 'AUX_GP IAT' with elevation=89965.46038983425 and 4 pts.
+2025-01-21 14:27:44,166 DEBUG:  Found 3D POLYLINE in layer 'AUX_GP IAT' with 4 pts.
+2025-01-21 14:27:44,167 DEBUG:  Found 3D POLYLINE in layer 'AUX_DME ATE' with 399 pts.
+2025-01-21 14:27:44,194 DEBUG:  Found 3D POLYLINE in layer 'AUX_VHF COM eccLEAL' with 994 pts.
+2025-01-21 14:27:44,196 DEBUG:  Found 3D POLYLINE in layer 'AUX_VHF COM eccLEAL' with 386 pts.
+2025-01-21 14:27:44,229 DEBUG:  Found 3D POLYLINE in layer 'AUX_ADS B LEAL' with 1317 pts.
+2025-01-21 14:27:44,230 DEBUG:  Found 3D POLYLINE in layer 'AUX_ADS B LEAL' with 387 pts.
+2025-01-21 14:27:44,231 DEBUG:  Found 3D POLYLINE in layer 'AUX_ ADS B RLEAC' with 1319 pts.
+2025-01-21 14:27:44,232 DEBUG:  Found 3D POLYLINE in layer 'AUX_ ADS B RLEAC' with 399 pts.
+2025-01-21 14:27:44,232 DEBUG:  Found 3D POLYLINE in layer 'AUX_RECNET LEAL' with 266 pts.
+2025-01-21 14:27:44,233 DEBUG:  Found 3D POLYLINE in layer 'AUX_RECNET LEAL' with 1318 pts.
+2025-01-21 14:27:44,234 DEBUG:  Found LWPOLYLINE in layer 'AUX_DME IAT' with elevation=35200.0 and 2 pts.
+2025-01-21 14:27:44,234 DEBUG:  Found 3D POLYLINE in layer 'AUX_DME IAT' with 408 pts.
+2025-01-21 14:27:44,235 DEBUG:  Found 3D POLYLINE in layer 'AUX_DME ATE' with 1318 pts.
+2025-01-21 14:27:44,236 DEBUG:  Found 3D POLYLINE in layer 'AUX_GP IAT' with 4 pts.
+2025-01-21 14:27:44,236 DEBUG:  Found 3D POLYLINE in layer 'AUX_DME ATE' with 399 pts.
+2025-01-21 14:27:44,237 DEBUG:  Found 3D POLYLINE in layer 'AUX_GP IAT' with 4 pts.
+2025-01-21 14:27:44,237 DEBUG:  Found LWPOLYLINE in layer 'AUX_GP IAT' with elevation=1044530.951953993 and 4 pts.
+2025-01-21 14:27:44,237 DEBUG:  Found 3D POLYLINE in layer 'AUX_GP IAT' with 4 pts.
+2025-01-21 14:27:44,238 DEBUG:  Found 3D POLYLINE in layer 'AUX_DME ATE' with 399 pts.
+2025-01-21 14:27:44,241 DEBUG:  Found 3D POLYLINE in layer 'AUX_VHF COM eccLEAL' with 994 pts.
+2025-01-21 14:27:44,244 DEBUG:  Found 3D POLYLINE in layer 'AUX_VHF COM eccLEAL' with 386 pts.
+2025-01-21 14:27:44,245 DEBUG:  Found 3D POLYLINE in layer 'AUX_ADS B LEAL' with 1317 pts.
+2025-01-21 14:27:44,246 DEBUG:  Found 3D POLYLINE in layer 'AUX_ADS B LEAL' with 387 pts.
+2025-01-21 14:27:44,248 DEBUG:  Found 3D POLYLINE in layer 'AUX_ ADS B RLEAC' with 1319 pts.
+2025-01-21 14:27:44,248 DEBUG:  Found 3D POLYLINE in layer 'AUX_ ADS B RLEAC' with 399 pts.
+2025-01-21 14:27:44,249 DEBUG:  Found 3D POLYLINE in layer 'AUX_RECNET LEAL' with 266 pts.
+2025-01-21 14:27:44,251 DEBUG:  Found 3D POLYLINE in layer 'AUX_RECNET LEAL' with 1318 pts.
+2025-01-21 14:27:44,251 DEBUG:  Found LWPOLYLINE in layer 'AUX_DME IAT' with elevation=48200.0 and 2 pts.
+2025-01-21 14:27:44,252 DEBUG:  Found 3D POLYLINE in layer 'AUX_DME IAT' with 408 pts.
+2025-01-21 14:27:44,254 DEBUG:  Found 3D POLYLINE in layer 'AUX_DME ATE' with 1318 pts.
+2025-01-21 14:27:44,254 DEBUG:  Found 3D POLYLINE in layer 'AUX_GP IAT' with 4 pts.
+2025-01-21 14:27:44,255 DEBUG:  Found 3D POLYLINE in layer 'AUX_DME ATE' with 399 pts.
+2025-01-21 14:27:44,256 DEBUG:Total layers in DXF: 7 => {'AUX_GP IAT', 'AUX_ ADS B RLEAC', 'AUX_VHF COM eccLEAL', 'AUX_RECNET LEAL', 'AUX_ADS B LEAL', 'AUX_DME ATE', 'AUX_DME IAT'}
+2025-01-21 14:27:44,256 DEBUG:Total entities in DXF: 48
+2025-01-21 14:27:44,257 DEBUG:Total valid contour layers: 7
+2025-01-21 14:27:44,257 DEBUG:
+Step 2: Generating TIN surfaces...
+2025-01-21 14:27:44,258 DEBUG:Generating TIN for layer 'AUX_GP IAT'...
+2025-01-21 14:27:44,266 DEBUG:  TIN built with 40 triangles / 32 pts in layer 'AUX_GP IAT'.
+2025-01-21 14:27:44,266 DEBUG:Generating TIN for layer 'AUX_DME ATE'...
+2025-01-21 14:27:44,553 DEBUG:  TIN built with 5542 triangles / 4232 pts in layer 'AUX_DME ATE'.
+2025-01-21 14:27:44,553 DEBUG:Generating TIN for layer 'AUX_VHF COM eccLEAL'...
+2025-01-21 14:27:44,770 DEBUG:  TIN built with 4522 triangles / 2760 pts in layer 'AUX_VHF COM eccLEAL'.
+2025-01-21 14:27:44,770 DEBUG:Generating TIN for layer 'AUX_ADS B LEAL'...
+2025-01-21 14:27:45,062 DEBUG:  TIN built with 5491 triangles / 3408 pts in layer 'AUX_ADS B LEAL'.
+2025-01-21 14:27:45,062 DEBUG:Generating TIN for layer 'AUX_ ADS B RLEAC'...
+2025-01-21 14:27:45,318 DEBUG:  TIN built with 5542 triangles / 3436 pts in layer 'AUX_ ADS B RLEAC'.
+2025-01-21 14:27:45,318 DEBUG:Generating TIN for layer 'AUX_RECNET LEAL'...
+2025-01-21 14:27:45,552 DEBUG:  TIN built with 5014 triangles / 3168 pts in layer 'AUX_RECNET LEAL'.
+2025-01-21 14:27:45,553 DEBUG:Generating TIN for layer 'AUX_DME IAT'...
+2025-01-21 14:27:45,559 DEBUG:  TIN built with 1226 triangles / 820 pts in layer 'AUX_DME IAT'.
+2025-01-21 14:27:45,560 DEBUG:
+Step 3: Calculating intersection lines...
+2025-01-21 14:27:45,560 DEBUG:Calculating intersection lines between TIN surfaces...
+2025-01-21 14:27:45,565 DEBUG:Total layer pairs to check: 21
