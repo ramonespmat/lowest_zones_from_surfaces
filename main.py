@@ -1,749 +1,255 @@
+# main.py
+
 import os
-import random
-import numpy as np
-from scipy.spatial import Delaunay
-import ezdxf
-import shapely
-from shapely.strtree import STRtree
-from shapely.geometry import LineString, Point, Polygon
-from shapely.ops import polygonize, unary_union, split, snap
-import pyvista as pv
-import time
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from tkinter import ttk  # For the progress bar
+from PIL import Image, ImageTk  # For handling images
+import webbrowser  # To open folders
+from processing import find_lowest_surfaces
+import threading
+import queue
 
-# Constants
-INPUT_DXF = "testcomplejo.dxf"
-OUTPUT_DXF = "output/lowest_zones.dxf"
+def resource_path(relative_path):
+    """ Get the absolute path to the resource, works for dev and PyInstaller """
+    import sys
+    try:
+        base_path = sys._MEIPASS
+    except AttributeError:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
-TIN_RESOLUTION = 10
-INTERSECTION_LAYER = "INTERSECTIONS"
-SNAP_TOLERANCE = 0.1  # <-- Adjust as needed
-DECIMATION_REDUCTION = 0.8
+def select_input_dxf():
+    file_path = filedialog.askopenfilename(
+        title="Select Input DXF File",
+        filetypes=[("DXF Files", "*.dxf"), ("All Files", "*.*")]
+    )
+    input_dxf_var.set(file_path)
+    if file_path:
+        # Automatically set output folder to 'output' inside the input file's directory
+        input_dir = os.path.dirname(file_path)
+        output_folder = os.path.join(input_dir, "output")
+        output_folder_var.set(output_folder)
 
-###############################################################################
-# STEP 1: READ DXF CONTOURS WITH ENFORCED CLOSURE
-###############################################################################
-def read_dxf_contours(file_path):
-    print(f"[DEBUG] Reading DXF file: {file_path}")
-    doc = ezdxf.readfile(file_path)
-    msp = doc.modelspace()
-
-    contours = {}
-    found_layers = set()
-    found_entities = 0
-
-    for entity in msp:
-        found_entities += 1
-
-        if entity.dxftype() == "LWPOLYLINE":
-            layer_name = entity.dxf.layer
-            found_layers.add(layer_name)
-            contours.setdefault(layer_name, [])
-            elevation = entity.dxf.elevation
-            coords = [(p[0], p[1], elevation) for p in entity.get_points()]
-
-            # Enforce closure
-            if coords and coords[0] != coords[-1]:
-                coords.append(coords[0])
-                print(f"[DEBUG]   Closed LWPOLYLINE in layer '{layer_name}'.")
-            contours[layer_name].append(coords)
-            print(f"[DEBUG]   Found LWPOLYLINE in layer '{layer_name}' with elevation={elevation} and {len(coords)} pts.")
-
-        elif entity.dxftype() == "POLYLINE" and entity.is_3d_polyline:
-            layer_name = entity.dxf.layer
-            found_layers.add(layer_name)
-            contours.setdefault(layer_name, [])
-            coords = [(v.dxf.location.x, v.dxf.location.y, v.dxf.location.z) for v in entity.vertices]
-
-            # Enforce closure
-            if coords and coords[0] != coords[-1]:
-                coords.append(coords[0])
-                print(f"[DEBUG]   Closed 3D POLYLINE in layer '{layer_name}'.")
-            contours[layer_name].append(coords)
-            print(f"[DEBUG]   Found 3D POLYLINE in layer '{layer_name}' with {len(coords)} pts.")
-
-    print(f"\n[DEBUG] Total layers in DXF: {len(found_layers)} => {found_layers}")
-    print(f"[DEBUG] Total entities in DXF: {found_entities}")
-    print(f"[DEBUG] Total valid contour layers: {len(contours)}")
-    return contours
-
-
-###############################################################################
-# STEP 2: GENERATE TIN FROM CONTOURS
-###############################################################################
-def generate_tin_from_contours(contours):
-    tins = {}
-    for layer, layer_contours in contours.items():
-        print(f"[DEBUG] Generating TIN for layer '{layer}'...")
-        points = np.array([pt for contour_line in layer_contours for pt in contour_line])
-        if len(points) < 3:
-            print(f"[DEBUG]   Layer '{layer}' has fewer than 3 pts, skipping.")
-            continue
-
-        xy = points[:, :2]
-        try:
-            tri = Delaunay(xy)
-            tins[layer] = {"points": points, "triangles": tri.simplices}
-            print(f"[DEBUG]   TIN built with {len(tri.simplices)} triangles / {len(points)} pts in layer '{layer}'.")
-        except Exception as e:
-            print(f"[ERROR]   Failed to build TIN for layer '{layer}': {e}")
-    return tins
-
-
-###############################################################################
-# UTILITY: COMPUTE GLOBAL Z-SCALE BASED ON EXTENTS
-###############################################################################
-def compute_global_z_scale(tins):
-    all_points = np.concatenate([tin["points"] for tin in tins.values()])
-    xrange = all_points[:,0].max() - all_points[:,0].min()
-    yrange = all_points[:,1].max() - all_points[:,1].min()
-    zrange = all_points[:,2].max() - all_points[:,2].min()
-    planar = max(xrange, yrange)
-    scale = planar / zrange if zrange != 0 else 1
-    print(f"[DEBUG] Global Z-scale computed: {scale}")
-    return scale
-
-
-###############################################################################
-# VISUALIZE TINS WITH CHECKBOXES, AUTO Z-SCALE, LEGENDS, AND INTERSECTIONS
-###############################################################################
-def reduce_lines_in_intersection(line, max_points=200):
-    """Ultra-fast point reduction with stride-based sampling"""
-    coords = np.array(line.coords)
-    if len(coords) <= max_points:
-        return line
-    
-    # Calculate optimal stride for fastest access pattern
-    stride = max(1, len(coords) // max_points)
-    reduced_coords = coords[::stride]
-    
-    # Ensure we don't exceed max_points while maintaining endpoints
-    if len(reduced_coords) > max_points:
-        reduced_coords = np.concatenate([reduced_coords[:max_points//2], reduced_coords[-max_points//2:]])
-    
-    print(f"Reduced {len(coords)} -> {len(reduced_coords)} points (stride {stride})")
-    return LineString(reduced_coords)
-
-def visualize_tins_with_checkboxes(tins, intersections=None, global_scale=1.0):
-    print("[DEBUG] Visualizing TIN surfaces with checkboxes...")
-    plotter = pv.Plotter(lighting='light_kit')  # Explicit lighting setup
-    
-    # Positioning parameters
-    start_y, dy, x_pos = 10, 30, 10
-    
-    for idx, (layer, tin) in enumerate(tins.items()):
-        # Create mesh with original lighting parameters
-        points = tin["points"].copy()
-        points[:, 2] *= global_scale
-        mesh = pv.PolyData(points, faces=np.hstack([[3] + list(tri) for tri in tin["triangles"]]))
-        mesh.point_data["Elevation"] = points[:, 2]
-        
-        # Add mesh with original visualization settings
-        y_pos = start_y + idx * dy
-        actor = plotter.add_mesh(
-            mesh,
-            show_edges=False,
-            scalars="Elevation",
-            cmap="viridis",
-            label=layer)
-        
-        # Add checkbox widget
-        plotter.add_checkbox_button_widget(
-            lambda state, a=actor: a.SetVisibility(state),
-            value=True,
-            position=(x_pos, y_pos),
-            size=20
+def progress_callback_handler(q, message):
+    """Handle special messages like opening folders."""
+    if message.startswith("OPEN_FOLDER:"):
+        folder_path = message.replace("OPEN_FOLDER:", "").strip()
+        output_link.config(
+            text=f"Open Output Folder: {folder_path}", 
+            fg="blue", 
+            cursor="hand2"
         )
-        plotter.add_text(layer, position=(x_pos + 25, y_pos), font_size=12)
+        output_link.bind("<Button-1>", lambda e: open_output_folder(folder_path))
+    else:
+        # Regular log messages are already handled in progress_listener
+        pass
 
-    # Add intersections with proper lighting
-    if intersections:
-        all_lines = []
-        for line in intersections:
-            reduced = reduce_lines_in_intersection(line)
-            coords = np.array(reduced.coords)
-            coords[:, 2] *= global_scale
-            all_lines.append(coords)
-        
-        if all_lines:
-            plotter.add_lines(
-                np.concatenate(all_lines), 
-                color="red", 
-                width=2,
-            )
+def progress_listener(q):
+    """Listen to the queue and update the GUI accordingly."""
+    try:
+        while True:
+            message = q.get_nowait()
+            if message.startswith("STEP:"):
+                # Update the step label
+                step_text = message.replace("STEP:", "").strip()
+                step_label.config(text=step_text)
+                # Increment the progress bar
+                progress_bar['value'] += 1
+            elif message.startswith("OPEN_FOLDER:"):
+                # Handle special message to open folder
+                progress_callback_handler(q, message)
+            else:
+                # It's a log message
+                log_text.insert(tk.END, message + "\n")
+                log_text.see(tk.END)
+    except queue.Empty:
+        pass
+    root.after(100, lambda: progress_listener(q))
 
-    plotter.add_legend()
-    plotter.show()
+def start_processing():
+    input_dxf = input_dxf_var.get()
+    # output_folder = output_folder_var.get()  # Removed output folder selection
+    snap_tolerance = snap_tolerance_var.get()
+    decimation_reduction = decimation_reduction_var.get()
+    visualize = visualize_var.get()
 
-###############################################################################
-# DECIMATE ALL TINS (unchanged)
-###############################################################################
-def decimate_all_tins(tins, reduction=0.3):
-    decimated_tins = {}
-    for layer, tin in tins.items():
-        points = tin["points"]
-        triangles = tin["triangles"]
+    if not input_dxf or not os.path.isfile(input_dxf):
+        messagebox.showerror("Error", "Please select a valid input DXF file.")
+        return
 
-        # Skip decimation if triangles are too few
-        if len(triangles) <= 20:
-            print(f"[DEBUG] Layer '{layer}': Skipping decimation (only {len(triangles)} triangles).")
-            decimated_tins[layer] = tin
-            continue
+    # Automatically set output folder to 'output' inside the input file's directory
+    input_dir = os.path.dirname(input_dxf)
+    output_folder = os.path.join(input_dir, "output")
+    output_dxf = os.path.join(output_folder, "lowest_zones.dxf")
 
-        # Create PolyData for processing
-        mesh = pv.PolyData(points)
-        mesh.faces = np.hstack([[3] + list(t) for t in triangles])
-        mesh = mesh.clean().triangulate()  # Pre-cleaning step
-        initial_tri_count = mesh.n_cells
+    # Create output folder if it doesn't exist
+    os.makedirs(output_folder, exist_ok=True)
 
-        # Dynamically adjust reduction factor based on triangle count
-        if initial_tri_count > 1000:
-            local_reduction = 0.6
-        elif initial_tri_count > 500:
-            local_reduction = 0.4
-        else:
-            local_reduction = 0.2
+    # Reset progress bar and logs
+    progress_bar['value'] = 0
+    step_label.config(text="Starting...")
+    log_text.delete(1.0, tk.END)
+    output_link.config(text="", fg="blue", cursor="hand2")
+    output_link.unbind("<Button-1>")
 
-        print(f"[DEBUG] Layer '{layer}': Using reduction = {local_reduction}.")
-        
-        # Perform decimation without `preserve_topology`
+    # Disable the Start button to prevent multiple runs
+    start_btn.config(state='disabled')
+
+    # Create a queue to communicate with the GUI
+    q = queue.Queue()
+
+    # Start the listener
+    root.after(100, lambda: progress_listener(q))
+
+    def processing_thread():
         try:
-            if local_reduction > 0:
-                mesh = mesh.decimate(local_reduction)
-            reduced_tri_count = mesh.n_cells
+            merged_polygons = find_lowest_surfaces(
+                input_dxf=input_dxf,
+                output_dxf=output_dxf,
+                snap_tolerance=snap_tolerance,
+                decimation_reduction=decimation_reduction,
+                visualize=visualize,
+                progress_callback=lambda msg: q.put(msg)
+            )
+            
+            msg_lines = ["Processing complete!"]
+            msg_lines.append(f"DXF output saved to: {output_dxf}")
+            if merged_polygons:
+                msg_lines.append(f"Total layers merged: {len(merged_polygons)}")
+            else:
+                msg_lines.append("No polygons were processed.")
 
-            # Handle cases where decimation doesn't reduce significantly
-            if reduced_tri_count == initial_tri_count:
-                print(f"[DEBUG] Layer '{layer}': Decimation did not reduce triangles significantly.")
-
-            print(f"[DEBUG] Layer '{layer}': Triangles reduced from {initial_tri_count} to {reduced_tri_count}.")
-            new_points = mesh.points
-            faces = mesh.faces.reshape((-1, 4))
-            new_triangles = faces[:, 1:]
-            decimated_tins[layer] = {"points": new_points, "triangles": new_triangles}
+            for line in msg_lines:
+                q.put(line)
+            
+            # Add clickable link to output folder
+            q.put(f"OPEN_FOLDER:{output_folder}")
 
         except Exception as e:
-            print(f"[ERROR] Layer '{layer}': Decimation failed: {e}")
-            decimated_tins[layer] = tin  # Add the original mesh if decimation fails
+            q.put(f"Error occurred during processing: {e}")
+            messagebox.showerror("Error", f"An error occurred:\n{e}")
+        finally:
+            # Re-enable the Start button after processing
+            start_btn.config(state='normal')
+
+    # Start the processing in a separate thread
+    thread = threading.Thread(target=processing_thread, daemon=True)
+    thread.start()
+
+def open_output_folder(folder_path):
+    webbrowser.open(folder_path)
+
+root = tk.Tk()
+root.title("Intersecciones Automáticas")
+
+# Top Frame for Image and Title
+top_frame = tk.Frame(root, padx=10, pady=10)
+top_frame.pack(fill='both')
+
+# Load navya.png
+try:
+    image_path = resource_path("navya.png")
+    image = Image.open(image_path)
+    image = image.resize((100, 100), Image.LANCZOS)  # Resize for consistency
+    img_tk = ImageTk.PhotoImage(image)
+    image_label = tk.Label(top_frame, image=img_tk)
+    image_label.pack()
+except Exception as e:
+    print(f"Error loading image: {e}")
+    image_label = tk.Label(top_frame, text="navya.png not found", fg="red")
+    image_label.pack()
+
+# Title
+title_label = tk.Label(top_frame, text="Intersecciones Automáticas", 
+                       font=("Helvetica", 16, "bold"), fg="black")
+title_label.pack()
+
+# Main Frame
+frame = tk.Frame(root, padx=10, pady=10)
+frame.pack(fill='both', expand=True)
+
+input_dxf_var = tk.StringVar()
+# output_folder_var = tk.StringVar()  # Removed output folder selection
+
+# Input for DXF File
+input_dxf_label = tk.Label(frame, text="Input DXF File:")
+input_dxf_label.grid(row=0, column=0, sticky='w')
+
+input_dxf_entry = tk.Entry(frame, textvariable=input_dxf_var, width=50)
+input_dxf_entry.grid(row=1, column=0, sticky='we', pady=5)
+
+input_dxf_browse_btn = tk.Button(frame, text="Browse...", command=select_input_dxf)
+input_dxf_browse_btn.grid(row=1, column=1, padx=5)
+
+# Removed Output Folder Widgets
+# output_folder_label = tk.Label(frame, text="Output Folder:")
+# output_folder_label.grid(row=2, column=0, sticky='w')
+
+# output_folder_entry = tk.Entry(frame, textvariable=output_folder_var, width=50)
+# output_folder_entry.grid(row=3, column=0, sticky='we', pady=5)
+
+# output_folder_browse_btn = tk.Button(frame, text="Browse...", command=select_output_folder)
+# output_folder_browse_btn.grid(row=3, column=1, padx=5)
+
+# -- Add two sliders for snap and decimation tolerance --
+snap_tolerance_var = tk.DoubleVar(value=0.1)
+decimation_reduction_var = tk.DoubleVar(value=0.5)
+
+# Snap Tolerance Slider
+snap_tolerance_label = tk.Label(frame, text="Snap Tolerance:")
+snap_tolerance_label.grid(row=2, column=0, sticky='w')
+
+snap_tolerance_scale = tk.Scale(
+    frame, from_=0.1, to=50.0, resolution=0.1, 
+    orient='horizontal', variable=snap_tolerance_var
+)
+snap_tolerance_scale.grid(row=3, column=0, sticky='we', pady=5)
+
+# Decimation Reduction Slider
+decimation_reduction_label = tk.Label(frame, text="Decimation Reduction:")
+decimation_reduction_label.grid(row=4, column=0, sticky='w')
+
+decimation_reduction_scale = tk.Scale(
+    frame, from_=0.1, to=1.0, resolution=0.05, 
+    orient='horizontal', variable=decimation_reduction_var
+)
+decimation_reduction_scale.grid(row=5, column=0, sticky='we', pady=5)
+
+# Add a checkbox for 3D visualization
+visualize_var = tk.BooleanVar()
+visualize_checkbox = tk.Checkbutton(frame, text="Show 3D Visualization", variable=visualize_var)
+visualize_checkbox.grid(row=6, column=0, columnspan=2, pady=5)
+
+# Start Button
+start_btn = tk.Button(frame, text="Start Processing", command=start_processing)
+start_btn.grid(row=7, column=0, columnspan=2, pady=10)
+
+# Progress Label
+step_label = tk.Label(frame, text="Ready", fg="blue", font=("Helvetica", 12, "bold"))
+step_label.grid(row=8, column=0, columnspan=2, pady=(0,5))
 
-    return decimated_tins
+# Progress Bar
+progress_bar = ttk.Progressbar(frame, orient='horizontal', length=400, mode='determinate')
+progress_bar.grid(row=9, column=0, columnspan=2, pady=5)
+progress_bar['maximum'] = 10  # Updated to match the number of steps
 
+# Log Text Widget with Scrollbar
+log_frame = tk.Frame(frame)
+log_frame.grid(row=10, column=0, columnspan=2, pady=5)
 
-###############################################################################
-# STEP 3: INTERSECTION LINES (using *DECIMATED* TIN surfaces)
-###############################################################################
-def calculate_intersection_lines(decimated_tins):
-    print("[DEBUG] Calculating intersection lines between decimated TIN surfaces...")
-    layers = list(decimated_tins.keys())
-    intersections = []
-    total_pairs = len(layers) * (len(layers) - 1) // 2
-    processed_pairs = 0
-    valid_intersections = 0
+log_scroll = tk.Scrollbar(log_frame)
+log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-    for i in range(len(layers)):
-        for j in range(i + 1, len(layers)):
-            layer1, layer2 = layers[i], layers[j]
-            processed_pairs += 1
-            print(f"[DEBUG]   Processing pair {processed_pairs}/{total_pairs}: '{layer1}' vs '{layer2}'")
-            pts1 = decimated_tins[layer1]["points"]
-            tri1 = decimated_tins[layer1]["triangles"]
-            pts2 = decimated_tins[layer2]["points"]
-            tri2 = decimated_tins[layer2]["triangles"]
+log_text = tk.Text(log_frame, height=10, width=60, wrap='word', yscrollcommand=log_scroll.set)
+log_text.pack(side=tk.LEFT, fill='both', expand=True)
+log_scroll.config(command=log_text.yview)
 
-            mesh1 = pv.PolyData(pts1)
-            mesh1.faces = np.hstack([[3] + list(t) for t in tri1])
-            
-            mesh2 = pv.PolyData(pts2)
-            mesh2.faces = np.hstack([[3] + list(t) for t in tri2])
-            # Collision check
-            collision_result = mesh1.collision(mesh2, box_tolerance=1e-0)
-            collision, ncol = collision_result
-            if ncol == 0:
-                print(f"[DEBUG]     => No collision detected between '{layer1}' and '{layer2}'. Skipping intersection.")
-                continue
+# Output Link Label (Initially hidden)
+output_link = tk.Label(frame, text="", fg="blue", cursor="hand2")
+output_link.grid(row=11, column=0, columnspan=2, pady=10)
 
-            # Intersection
-            try:
-                intersection_line, _, _ = mesh1.intersection(mesh2, split_first=False, split_second=False)
-                if isinstance(intersection_line, pv.PolyData) and intersection_line.n_points > 1:
-                    print(f"[DEBUG]     => Valid intersection found: {intersection_line.n_points} pts, {intersection_line.n_cells} lines.")
-                    for cidx in range(intersection_line.n_cells):
-                        cell = intersection_line.extract_cells(cidx)
-                        if cell.n_points > 1:
-                            arr = np.array(cell.points)
-                            intersections.append(LineString(arr))
-                            valid_intersections += 1
-            except Exception as e:
-                print(f"[ERROR]     => Failed to compute intersection between '{layer1}' and '{layer2}': {e}")
+# Configure grid to make entries expandable
+frame.columnconfigure(0, weight=1)
 
-    print(f"[DEBUG] Total intersection lines found: {valid_intersections}")
-    return intersections
-
-
-###############################################################################
-# STEP 3A: SNAP INTERSECTION LINES TO NEAREST ORIGINAL CONTOUR (as before)
-###############################################################################
-def snap_intersections_to_contours(intersections, contours, tolerance=SNAP_TOLERANCE):
-    """
-    Snaps each intersection line's vertices to the nearest contour geometry if
-    within tolerance. This is your original 'snap_intersections_to_contours' logic.
-    """
-    print("[DEBUG] Snapping intersection lines to original contours. Tolerance =", tolerance)
-    original_lines = []
-    for layer, lines in contours.items():
-        for coords in lines:
-            original_lines.append(LineString(coords))
-    
-    snapped = []
-    total_snapped = 0
-    for line in intersections:
-        coords = list(line.coords)
-        new_coords = []
-        snap_count = 0
-        for pt in coords:
-            p2d = Point(pt[:2])
-            min_d = float("inf")
-            best_line = None
-            for candidate_line in original_lines:
-                d = candidate_line.distance(p2d)
-                if d < min_d:
-                    min_d = d
-                    best_line = candidate_line
-            if min_d < tolerance and best_line is not None:
-                proj = best_line.interpolate(best_line.project(p2d))
-                z_val = pt[2] if len(pt) > 2 else 0
-                new_coords.append((proj.x, proj.y, z_val))
-                snap_count += 1
-            else:
-                new_coords.append(pt)
-        total_snapped += snap_count
-        snapped.append(LineString(new_coords))
-    
-    print(f"[DEBUG] Total intersection lines processed: {len(intersections)}")
-    print(f"[DEBUG] Total snapped points across all intersection lines: {total_snapped}")
-    return snapped
-
-
-###############################################################################
-# 4A: SPLIT LINES AT ALL CROSSINGS (unchanged from your version)
-###############################################################################
-def split_lines_at_crossings_with_strtree(lines_2d):
-    """
-    Use a spatial index (STRtree) to quickly find candidate lines that might intersect.
-    This reduces the naive O(N^2) intersection checks, especially for large datasets.
-
-    We'll maintain a stable list of geometries (geoms_list) and a dictionary
-    from geometry ID -> index, so we can find the index of any returned geometry
-    without lines_2d.index(...) calls. Also we add progress prints.
-    """
-    print("[DEBUG] Splitting lines at crossing points with STRtree...")
-
-    changed = True
-    iteration_count = 0
-
-    # lines_2d can be used to build a stable reference list of geometries
-    geoms_list = lines_2d[:]  # make a copy
-    # Build a dictionary from geometry's id(...) to the index in geoms_list
-    # so we can quickly get the index from the geometry returned by the STRtree
-    geoms_map = {id(g): i for i, g in enumerate(geoms_list)}
-
-    while changed:
-        changed = False
-        iteration_count += 1
-
-        # Build an STRtree from the stable list geoms_list
-        tree = STRtree(geoms_list)
-
-        new_geoms = []
-        used = set()  # We'll keep track of geometry indices that got replaced
-
-        n = len(geoms_list)
-        print(f"[DEBUG]   pass={iteration_count}, building STRtree with {n} lines.")
-
-        # Print progress every 10% of lines
-        progress_step = max(n // 10, 1)
-
-        for i, line in enumerate(geoms_list):
-            # Progress message
-            if i % progress_step == 0:
-                pct = (i / n) * 100
-                print(f"[DEBUG]     progress: {i}/{n} (~{pct:.0f}%) in pass={iteration_count}")
-
-            # If this line was replaced in a previous operation, skip it
-            if i in used:
-                continue
-
-            splitted_i = [line]
-            replaced_i = False
-
-            # Query the tree for bounding-box overlaps
-            candidates = tree.query(line)
-
-            for candidate in candidates:
-                # Skip if it's the same geometry object
-                if candidate is line:
-                    continue
-
-                # Attempt to find the index of `candidate` via the dictionary
-                cand_id = id(candidate)
-                j = geoms_map.get(cand_id, None)
-                if j is None:
-                    # Means we don't recognize this geometry in the current geoms_map
-                    # Could happen if the geometry was replaced previously
-                    continue
-
-                if j in used:
-                    continue
-
-                # Intersection check
-                inter = splitted_i[-1].intersection(candidate)
-                if not inter.is_empty and inter.geom_type == 'Point':
-                    pt = inter
-                    # Check if the point is not an endpoint for either line
-                    if (not pt.equals(Point(splitted_i[-1].coords[0])) and
-                        not pt.equals(Point(splitted_i[-1].coords[-1])) and
-                        not pt.equals(Point(candidate.coords[0])) and
-                        not pt.equals(Point(candidate.coords[-1]))):
-                        
-                        # Split the last sub-line of splitted_i
-                        splitted1 = split(splitted_i.pop(), pt)
-                        splitted_i.extend(list(splitted1.geoms))
-
-                        # Split the candidate line
-                        splitted2 = split(candidate, pt)
-
-                        # Mark candidate as used
-                        used.add(j)
-
-                        # We'll add splitted2 pieces to new_geoms
-                        new_geoms.extend(list(splitted2.geoms))
-
-                        replaced_i = True
-                        changed = True
-
-            # If we replaced line i with splits, mark i as used
-            if replaced_i:
-                used.add(i)
-                new_geoms.extend(splitted_i)
-            else:
-                new_geoms.append(line)
-
-        # Rebuild geoms_list and geoms_map from new_geoms
-        geoms_list = new_geoms
-        geoms_map = {id(g): idx for idx, g in enumerate(geoms_list)}
-
-        print(f"[DEBUG]   pass={iteration_count} => total lines now = {len(geoms_list)}")
-
-    print("[DEBUG] Done splitting lines with STRtree.")
-    return geoms_list
-
-
-###############################################################################
-# 4B (MODIFIED): POLYGONIZATION WITH GLOBAL SNAP
-###############################################################################
-def snap_all_lines(lines_2d, tolerance):
-    """
-    Snap a list of LineStrings to each other (unary_union), so that near misses
-    become real shared vertices within tolerance.
-    """
-    merged = unary_union(lines_2d)
-    # Snap merged geometry to itself
-    snapped_merged = snap(merged, merged, tolerance)
-    if snapped_merged.is_empty:
-        return []
-
-    # Convert back to a list of LineStrings
-    out_lines = []
-    if snapped_merged.geom_type == 'LineString':
-        out_lines.append(snapped_merged)
-    elif snapped_merged.geom_type == 'MultiLineString':
-        out_lines.extend(list(snapped_merged.geoms))
-    else:
-        # Possibly a GeometryCollection
-        for g in snapped_merged.geoms:
-            if g.geom_type == 'LineString':
-                out_lines.append(g)
-            elif g.geom_type == 'MultiLineString':
-                out_lines.extend(list(g.geoms))
-    return out_lines
-
-
-def build_planar_polygons(contours, snapped_intersections, snap_tolerance=SNAP_TOLERANCE):
-    print("[DEBUG] Building planar polygons from lines...")
-
-    # 1) Convert all contour lines to 2D
-    contour_lines_2d = []
-    for layer, lines in contours.items():
-        for coords in lines:
-            coords_2d = [(x, y) for (x, y, z) in coords]
-            if coords_2d and coords_2d[0] != coords_2d[-1]:
-                coords_2d.append(coords_2d[0])
-            contour_lines_2d.append(LineString(coords_2d))
-
-    # 2) Convert intersection lines to 2D
-    intersection_lines_2d = []
-    for line in snapped_intersections:
-        coords_2d = [(x, y) for (x, y, z) in line.coords]
-        if coords_2d and coords_2d[0] != coords_2d[-1]:
-            coords_2d.append(coords_2d[0])
-        intersection_lines_2d.append(LineString(coords_2d))
-
-    # Combine them
-    all_lines_2d = contour_lines_2d + intersection_lines_2d
-    print(f"[DEBUG] Total lines before snapping: {len(all_lines_2d)}")
-
-    # (Optional) quick visualization of raw lines
-    # visualize_lines(all_lines_2d)
-
-    # 3) Snap all lines so near misses become real intersections
-    snapped_lines_2d = snap_all_lines(all_lines_2d, snap_tolerance)
-    print("[DEBUG] Lines snapped to each other with tolerance =", snap_tolerance)
-
-    # 4) Split lines at crossing points
-    splitted_lines_2d = split_lines_at_crossings_with_strtree(snapped_lines_2d)
-    print(f"[DEBUG] => After splitting, we have {len(splitted_lines_2d)} lines total.")
-
-    # 5) Merge lines
-    merged = unary_union(splitted_lines_2d)
-
-    # 6) Polygonize
-    polys = list(polygonize(merged))
-    print(f"[DEBUG] => Polygonize produced {len(polys)} polygons.")
-
-    # (Optional) visualize polygons
-    # visualize_polygons(polys)
-
-    return polys
-
-
-###############################################################################
-# VISUALIZATION HELPERS
-###############################################################################
-def visualize_lines(lines_2d):
-    print("[DEBUG] Visualizing all input lines before polygonization...")
-    plotter = pv.Plotter()
-    for line in lines_2d:
-        coords = np.array(line.coords)
-        coords_3d = np.column_stack((coords, np.zeros(len(coords))))
-        if len(coords_3d) > 1:
-            polyline = pv.PolyData(coords_3d)
-            n = len(coords_3d)
-            cells = np.hstack([[n], list(range(n))])
-            polyline.lines = cells
-            plotter.add_mesh(polyline, color="blue", line_width=2)
-    plotter.show()
-
-
-def visualize_polygons(polygons):
-    print("[DEBUG] Visualizing polygon boundaries...")
-    plotter = pv.Plotter()
-    for poly in polygons:
-        coords = np.array(poly.exterior.coords)
-        coords_3d = np.column_stack((coords, np.zeros(len(coords))))
-        if len(coords_3d) > 1:
-            polyline = pv.PolyData(coords_3d)
-            n = len(coords_3d)
-            cells = np.hstack([[n], list(range(n))])
-            polyline.lines = cells
-            plotter.add_mesh(polyline, color="green", line_width=3)
-    plotter.show()
-
-
-###############################################################################
-# STEP 5: LABEL POLYGONS WITH THEIR LOWEST TIN
-###############################################################################
-def interpolate_tin_z(x, y, tin):
-    points = tin["points"]
-    tri = tin["triangles"]
-    for simplex in tri:
-        p0 = points[simplex[0]]
-        p1 = points[simplex[1]]
-        p2 = points[simplex[2]]
-        x0, y0 = p0[0], p0[1]
-        x1, y1 = p1[0], p1[1]
-        x2, y2 = p2[0], p2[1]
-        denom = (y1 - y2)*(x0 - x2) + (x2 - x1)*(y0 - y2)
-        if abs(denom) < 1e-12:
-            continue
-        a = ((y1 - y2)*(x - x2) + (x2 - x1)*(y - y2)) / denom
-        b = ((y2 - y0)*(x - x2) + (x0 - x2)*(y - y2)) / denom
-        c = 1 - a - b
-        if (a >= 0) and (b >= 0) and (c >= 0):
-            z0, z1, z2 = p0[2], p1[2], p2[2]
-            return a*z0 + b*z1 + c*z2
-    return None
-
-
-def label_polygons_with_lowest_tin(polygons, tins):
-    print("[DEBUG] Labeling polygons with their lowest TIN surface...")
-    labeled = []
-    layer_names = list(tins.keys())
-    for i, poly in enumerate(polygons, start=1):
-        if poly.is_empty:
-            continue
-        center = poly.centroid
-        xC, yC = center.x, center.y
-        best_layer = None
-        best_z = None
-        for layer in layer_names:
-            z_val = interpolate_tin_z(xC, yC, tins[layer])
-            if z_val is not None:
-                if best_z is None or z_val < best_z:
-                    best_z = z_val
-                    best_layer = layer
-        if best_layer is not None:
-            labeled.append((poly, best_layer))
-        else:
-            labeled.append((poly, "NO_TIN"))
-        print(f"  Polygon #{i} => lowest = {best_layer}")
-    return labeled
-
-
-###############################################################################
-# STEP 6: MERGE ADJACENT POLYGONS WITH THE SAME LABEL
-###############################################################################
-def merge_polygons_by_tin(labeled_polys):
-    print("[DEBUG] Merging adjacent polygons that share the same TIN label...")
-    from collections import defaultdict
-    grouping = defaultdict(list)
-    for poly, layer in labeled_polys:
-        grouping[layer].append(poly)
-    merged_result = {}
-    for layer, polys in grouping.items():
-        merged_poly = unary_union(polys)
-        merged_result[layer] = merged_poly
-        print(f"[DEBUG]   {len(polys)} polygons merged into one geometry for layer '{layer}'")
-    return merged_result
-
-
-###############################################################################
-# EXPORT FINAL POLYGONS
-###############################################################################
-def export_final_polygons(dxf_file, contours, intersection_lines, merged_dict):
-    print("[DEBUG] Exporting final results to DXF:", dxf_file)
-    doc = ezdxf.new()
-    msp = doc.modelspace()
-
-    # Original contour lines
-    for layer_name, lines in contours.items():
-        for coords in lines:
-            msp.add_polyline3d(coords, dxfattribs={"layer": layer_name})
-
-    # Intersection lines
-    for i, line in enumerate(intersection_lines, start=1):
-        coords = list(line.coords)
-        msp.add_polyline3d(coords, dxfattribs={"layer": INTERSECTION_LAYER})
-
-    # Merged polygons by TIN label
-    for layer_label, geom in merged_dict.items():
-        if geom.is_empty:
-            continue
-        if geom.geom_type == "Polygon":
-            polygons = [geom]
-        elif geom.geom_type == "MultiPolygon":
-            polygons = list(geom.geoms)
-        else:
-            polygons = []
-        for poly in polygons:
-            if poly.is_empty:
-                continue
-            xys = list(poly.exterior.coords)
-            coords_3d = [(x, y, 0.0) for (x, y) in xys]
-            msp.add_polyline3d(coords_3d, dxfattribs={"layer": f"FINAL_{layer_label}"})
-            for interior in poly.interiors:
-                xys_int = list(interior.coords)
-                coords_int_3d = [(x, y, 0.0) for (x, y) in xys_int]
-                msp.add_polyline3d(coords_int_3d, dxfattribs={"layer": f"FINAL_{layer_label}_HOLE"})
-
-    doc.saveas(dxf_file)
-    print("[DEBUG] DXF export complete.")
-
-
-###############################################################################
-# VISUALIZE LABELED POLYGONS
-###############################################################################
-def visualize_labeled_polygons(labeled_polys):
-    print("[DEBUG] Visualizing labeled polygons...")
-    plotter = pv.Plotter()
-    unique_labels = list(set(layer for poly, layer in labeled_polys))
-    colors = {label: [random.random(), random.random(), random.random()] for label in unique_labels}
-    for poly, layer in labeled_polys:
-        coords = np.array(poly.exterior.coords)
-        coords_3d = np.column_stack((coords, np.zeros(len(coords))))
-        if len(coords_3d) > 1:
-            polydata = pv.PolyData(coords_3d)
-            n = len(coords_3d)
-            cells = np.hstack([[n], list(range(n))])
-            polydata.lines = cells
-            color = colors.get(layer, [0.5, 0.5, 0.5])
-            plotter.add_mesh(polydata, color=color, line_width=3)
-            centroid = poly.centroid
-            label_point = np.array([[centroid.x, centroid.y, 0.0]])
-            plotter.add_point_labels(label_point, [layer], text_color='white', font_size=10)
-    plotter.show()
-
-
-###############################################################################
-# MAIN WORKFLOW
-###############################################################################
-def main():
-    print("[DEBUG] Step 1: Reading contours...")
-    contours = read_dxf_contours(INPUT_DXF)
-    if not contours:
-        print("[ERROR] No contours found. Exiting.")
-        return
-
-    print("\n[DEBUG] Step 2: Generating TIN surfaces...")
-    tins = generate_tin_from_contours(contours)
-    if not tins:
-        print("[ERROR] No valid TINs generated. Exiting.")
-        return
-
-    # Compute global Z-scale
-    global_scale = compute_global_z_scale(tins)
-
-    # (Optional) visualize original TINs
-    visualize_tins_with_checkboxes(tins, global_scale=global_scale)
-
-    print("\n[DEBUG] Step 2A: (Optionally) Decimate TINs for intersection")
-    decimated_tins = decimate_all_tins(tins, reduction=DECIMATION_REDUCTION)
-
-    print("\n[DEBUG] Step 3: Calculating intersection lines...")
-    intersections = calculate_intersection_lines(decimated_tins)
-    if not intersections:
-        print("[DEBUG] No valid intersection lines found.")
-    else:
-        print(f"[DEBUG] Total valid intersections after computation: {len(intersections)}")
-
-    print("\n[DEBUG] Step 3a: Snapping intersection lines to original contours...")
-    snapped_intersections = snap_intersections_to_contours(intersections, contours, tolerance=SNAP_TOLERANCE)
-
-    print("\n[DEBUG] Step 4: Building planar polygons from lines (contours + intersections)...")
-    polygons = build_planar_polygons(contours, snapped_intersections, snap_tolerance=SNAP_TOLERANCE)
-    if not polygons:
-        print("[DEBUG] No polygons were created. Exiting.")
-        return
-
-    # (Optional) visualize polygons
-    visualize_polygons(polygons)
-
-    print("\n[DEBUG] Step 5: Label each polygon with its lowest TIN surface...")
-    labeled_polys = label_polygons_with_lowest_tin(polygons, decimated_tins)
-
-    # Visualize labeled polygons
-    visualize_labeled_polygons(labeled_polys)
-
-    print("\n[DEBUG] Step 6: Merge polygons by TIN label...")
-    merged_by_tin = merge_polygons_by_tin(labeled_polys)
-
-    print("\n[DEBUG] Final Visualization (TINs + intersections + legends)...")
-    visualize_tins_with_checkboxes(decimated_tins, intersections=snapped_intersections, global_scale=global_scale)
-
-    print("\n[DEBUG] Step 7: Export results to DXF...")
-    os.makedirs(os.path.dirname(OUTPUT_DXF), exist_ok=True)
-    export_final_polygons(OUTPUT_DXF, contours, snapped_intersections, merged_by_tin)
-
-    print(f"\n[DEBUG] Workflow complete. Results saved to '{OUTPUT_DXF}'.")
-
-
-if __name__ == "__main__":
-    main()
+root.mainloop()
