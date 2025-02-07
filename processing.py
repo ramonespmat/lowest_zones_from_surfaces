@@ -8,6 +8,7 @@ import ezdxf
 from shapely.strtree import STRtree
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import polygonize, unary_union, split, snap
+from shapely.prepared import prep
 import pyvista as pv
 from collections import defaultdict
 import threading  # For running visualization in a separate thread
@@ -616,17 +617,29 @@ def export_final_polygons(dxf_file, contours, intersection_lines, merged_dict, p
     doc = ezdxf.new()
     msp = doc.modelspace()
 
-    # Original contour lines
+    # Export original contour lines
     for layer_name, lines in contours.items():
         for coords in lines:
             msp.add_polyline3d(coords, dxfattribs={"layer": layer_name})
 
-    # Intersection lines
+    # Export all computed intersection lines to the INTERSECTION_LAYER
     for i, line in enumerate(intersection_lines, start=1):
         coords = list(line.coords)
         msp.add_polyline3d(coords, dxfattribs={"layer": INTERSECTION_LAYER})
 
-    # Merged polygons by TIN label
+    # ---- NEW: Export used intersections ----
+    print("[DEBUG] Exporting used intersections to 'USED_INTERSECTIONS' layer...")
+    used_intersections = filter_used_intersections(intersection_lines, merged_dict, tolerance=0.1)
+    total_used = len(used_intersections)
+    for i, line in enumerate(used_intersections, start=1):
+        coords = list(line.coords)
+        msp.add_polyline3d(coords, dxfattribs={"layer": "USED_INTERSECTIONS"})
+        # Print progress every 10%
+        if i % max(1, total_used // 10) == 0:
+            print(f"[DEBUG] Exported {i}/{total_used} used intersections to DXF.")
+    # ---- End New Section ----
+
+    # Export merged polygons by TIN label
     for layer_label, geom in merged_dict.items():
         if geom.is_empty:
             continue
@@ -651,6 +664,8 @@ def export_final_polygons(dxf_file, contours, intersection_lines, merged_dict, p
     print("[DEBUG] DXF export complete.")
     if progress_callback:
         progress_callback("DXF export complete.")
+
+
 
 def find_lowest_surfaces(input_dxf, output_dxf, snap_tolerance=0.1, decimation_reduction=0.5, visualize=False, progress_callback=None):
     """
@@ -745,3 +760,57 @@ def find_lowest_surfaces(input_dxf, output_dxf, snap_tolerance=0.1, decimation_r
         progress_callback(f"Workflow complete. Results saved to '{output_dxf}'.")
 
     return merged_by_tin
+
+def filter_used_intersections(intersection_lines, merged_polygons, tolerance=0.1):
+    """
+    From the given list of intersection_lines (LineString objects in 3D),
+    returns only those intersections that appear along the boundaries of the final (merged) polygons.
+    
+    This version uses a prepared geometry for fast spatial queries and prints progress.
+    
+    Parameters:
+        intersection_lines (list): List of LineString objects (with 3D coordinates).
+        merged_polygons (dict): Dictionary of merged polygons keyed by TIN label.
+        tolerance (float): Tolerance distance to decide if a line is part of a boundary.
+        
+    Returns:
+        used_intersections (list): List of LineString objects that were used.
+    """
+    # 1) Extract all polygon boundaries (in 2D) from merged polygons
+    boundaries = []
+    for geom in merged_polygons.values():
+        if geom.is_empty:
+            continue
+        if geom.geom_type == "Polygon":
+            boundaries.append(geom.boundary)
+        elif geom.geom_type == "MultiPolygon":
+            for poly in geom.geoms:
+                boundaries.append(poly.boundary)
+    
+    if not boundaries:
+        print("[DEBUG] No polygon boundaries found!")
+        return []
+    
+    # 2) Create a union of all boundaries and buffer it once
+    final_boundaries = unary_union(boundaries)
+    final_boundaries_buffered = final_boundaries.buffer(tolerance)
+    prepared_boundaries = prep(final_boundaries_buffered)
+    
+    used_intersections = []
+    total = len(intersection_lines)
+    print(f"[DEBUG] Filtering used intersections: {total} intersections to check.")
+    
+    # 3) Check each intersection line (converted to 2D) using the prepared geometry
+    for idx, line in enumerate(intersection_lines, start=1):
+        # Convert the 3D line to 2D (drop the Z coordinate)
+        line2d = LineString([(pt[0], pt[1]) for pt in line.coords])
+        # If the buffered boundaries completely cover the intersection line, count it as used
+        if prepared_boundaries.covers(line2d):
+            used_intersections.append(line)
+        
+        # Print progress every 10%
+        if idx % max(1, total // 10) == 0:
+            print(f"[DEBUG] Processed {idx}/{total} intersections.")
+
+    print(f"[DEBUG] Filtered {len(used_intersections)} used intersections out of {total}.")
+    return used_intersections

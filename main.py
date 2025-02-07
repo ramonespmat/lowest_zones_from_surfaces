@@ -1,6 +1,15 @@
-# main.py
-
 import os
+import sys
+
+if sys.platform == "win32":
+    # Add the folder containing the VTK DLLs to the DLL search path.
+    vtk_dll_folder = r"C:\Users\respelt\AppData\Local\anaconda3\envs\tin_env\lib\site-packages\vtk.libs"
+    if os.path.isdir(vtk_dll_folder):
+        os.add_dll_directory(vtk_dll_folder)
+    else:
+        print("Warning: VTK DLL folder not found:", vtk_dll_folder)
+
+        
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk  # For the progress bar
